@@ -1,0 +1,95 @@
+name: render
+
+on:
+  repository_dispatch:
+    types: [render]
+  workflow_dispatch:
+    inputs:
+      audio_url:
+        description: Public URL of a voiceover (wav or mp3)
+        required: true
+      script:
+        description: Voiceover text
+        required: false
+      hook:
+        description: On-screen hook
+        required: false
+        default: Stop following generic plans
+      video_search:
+        description: Pexels search
+        required: false
+        default: home workout
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      JOB_ID: ${{ github.event.client_payload.job_id || github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Download fonts
+        run: |
+          mkdir -p fonts
+          base=https://github.com/google/fonts/raw/main/ofl
+          curl -sSfL -o fonts/Anton-Regular.ttf        $base/anton/Anton-Regular.ttf
+          curl -sSfL -o fonts/BebasNeue-Regular.ttf    $base/bebasneue/BebasNeue-Regular.ttf
+          curl -sSfL -o fonts/ArchivoBlack-Regular.ttf $base/archivoblack/ArchivoBlack-Regular.ttf
+          curl -sSfL -o fonts/Poppins-ExtraBold.ttf    $base/poppins/Poppins-ExtraBold.ttf
+
+      - name: Render video
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+          AUDIO_URL: ${{ github.event.client_payload.audio_url || inputs.audio_url }}
+          SCRIPT_B64: ${{ github.event.client_payload.script_b64 }}
+          HOOK_B64: ${{ github.event.client_payload.hook_b64 }}
+          VIDEO_SEARCH_B64: ${{ github.event.client_payload.video_search_b64 }}
+          TITLE_B64: ${{ github.event.client_payload.title_b64 }}
+          CAPTION_B64: ${{ github.event.client_payload.caption_b64 }}
+          SCRIPT: ${{ inputs.script }}
+          HOOK: ${{ inputs.hook }}
+          VIDEO_SEARCH: ${{ inputs.video_search }}
+        run: python render.py
+
+      - name: Publish video as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "job-$JOB_ID" work/final.mp4 work/meta.json \
+            --title "faceless ai $JOB_ID" --notes "Rendered by the faceless ai pipeline."
+
+      - name: Remember used clips
+        run: |
+          git config user.name "faceless-ai-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add used_clips.json
+          git commit -m "used clips for job $JOB_ID" || echo "nothing to commit"
+          git push || echo "push skipped"
+
+      - name: Send video to Make
+        env:
+          MAKE_WEBHOOK_URL: ${{ secrets.MAKE_WEBHOOK_URL }}
+        run: |
+          if [ -z "$MAKE_WEBHOOK_URL" ]; then echo "MAKE_WEBHOOK_URL secret not set"; exit 0; fi
+          url="https://github.com/${{ github.repository }}/releases/download/job-$JOB_ID/final.mp4"
+          jq --arg video_url "$url" '. + {video_url: $video_url}' work/meta.json > payload.json
+          curl -sSf -X POST "$MAKE_WEBHOOK_URL" -H "Content-Type: application/json" --data @payload.json
